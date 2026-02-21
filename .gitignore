@@ -1,0 +1,22 @@
+# Data files (downloaded at runtime)
+data/
+*.csv
+
+# Generated outputs
+treemap_hierarchical.html
+treemap_hierarchical.png
+treemap_enrichment.png
+
+# Jupyter
+.ipynb_checkpoints/
+executed_test.ipynb
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# OS
+.DS_Store
+Thumbs.db
