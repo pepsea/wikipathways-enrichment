@@ -53,9 +53,8 @@ print("セットアップ完了 ✓")""")
 md("""---
 ## 2. WikiPathways GMTファイルのダウンロード
 
-[WikiPathways](https://www.wikipathways.org/) から最新のGMTファイルをローカルにダウンロードします。
-
-> **注意**: 公式GMTはEntrez Gene IDを使用しています。エンリッチメント解析には遺伝子シンボル対応のGMTも別途取得します。""")
+[WikiPathways](https://www.wikipathways.org/) から最新の公式GMTファイルをローカルにダウンロードします。  
+公式GMTはEntrez Gene IDを使用しているため、NCBI gene_infoで遺伝子シンボルに変換します。""")
 
 code("""# --- 設定 ---
 SPECIES = "Homo_sapiens"          # 対象の生物種（必要に応じて変更）
@@ -99,53 +98,84 @@ def download_official_gmt(species: str, data_dir: str) -> str:
 official_gmt = download_official_gmt(SPECIES, DATA_DIR)
 
 # ====================================
-# 2-2. Enrichr WikiPathways GMTのダウンロード（遺伝子シンボル版）
+# 2-2. NCBI gene_info のダウンロード（Entrez ID → Gene Symbol マッピング用）
 # ====================================
-def download_enrichr_gmt(library_name: str, data_dir: str) -> str:
-    \"\"\"Enrichrから遺伝子シンボル版GMTをダウンロード\"\"\"
-    filepath = os.path.join(data_dir, f"{library_name}.gmt")
+import gzip
+
+def download_gene_info(species_name: str, data_dir: str) -> dict:
+    \"\"\"NCBI gene_infoをダウンロードしてEntrez ID → Gene Symbolの辞書を返す\"\"\"
+    filepath = os.path.join(data_dir, f"{species_name}.gene_info.gz")
     
-    if os.path.exists(filepath):
+    if not os.path.exists(filepath):
+        url = f"https://ftp.ncbi.nlm.nih.gov/gene/DATA/GENE_INFO/Mammalia/{species_name}.gene_info.gz"
+        print(f"NCBI gene_info ダウンロード中: {species_name}")
+        resp = requests.get(url, timeout=60)
+        resp.raise_for_status()
+        with open(filepath, 'wb') as f:
+            f.write(resp.content)
+        print(f"✓ 保存完了: {filepath} ({len(resp.content):,} bytes)")
+    else:
         print(f"既存ファイルを使用: {filepath}")
-        return filepath
     
-    print(f"Enrichrからダウンロード中: {library_name}")
-    url = f"https://maayanlab.cloud/Enrichr/geneSetLibrary?mode=text&libraryName={library_name}"
-    resp = requests.get(url, timeout=30)
-    resp.raise_for_status()
+    # Entrez ID → Gene Symbol の辞書を作成
+    entrez_to_symbol = {}
+    with gzip.open(filepath, 'rt') as f:
+        header = f.readline()  # ヘッダー行をスキップ
+        for line in f:
+            parts = line.strip().split('\\t')
+            if len(parts) >= 3:
+                gene_id = parts[1]   # GeneID
+                symbol = parts[2]    # Symbol
+                entrez_to_symbol[gene_id] = symbol
     
-    with open(filepath, 'w') as f:
-        f.write(resp.text)
-    
-    print(f"✓ 保存完了: {filepath} ({len(resp.text):,} bytes)")
-    return filepath
+    print(f"✓ マッピング数: {len(entrez_to_symbol):,} genes")
+    return entrez_to_symbol
 
-ENRICHR_LIBRARY = "WikiPathways_2024_Human"  # 遺伝子シンボル版
-enrichr_gmt = download_enrichr_gmt(ENRICHR_LIBRARY, DATA_DIR)
-print(f"\\n使用するGMTファイル:")
-print(f"  公式 (Entrez ID): {official_gmt}")
-print(f"  解析用 (Symbol):  {enrichr_gmt}")""")
+entrez_to_symbol = download_gene_info(SPECIES, DATA_DIR)
+print(f"\\n使用データ:")
+print(f"  公式GMT: {official_gmt}")
+print(f"  遺伝子マッピング: NCBI gene_info ({len(entrez_to_symbol):,} entries)")""")
 
-code("""# GMTファイルの内容を確認
-def parse_gmt(filepath: str) -> dict:
-    \"\"\"GMTファイルをパースしてパスウェイ名 -> 遺伝子セットの辞書を返す\"\"\"
+code("""# ====================================
+# 2-3. GMTファイルの読み込みと遺伝子シンボルへの変換
+# ====================================
+def parse_gmt_with_mapping(filepath: str, id_to_symbol: dict) -> dict:
+    \"\"\"
+    公式WikiPathways GMT（Entrez ID）をパースし、
+    遺伝子シンボルに変換したパスウェイ辞書を返す
+    \"\"\"
     pathways = OrderedDict()
+    unmapped_count = 0
+    
     with open(filepath, 'r') as f:
         for line in f:
             parts = line.strip().split('\\t')
             if len(parts) >= 3:
                 pathway_name = parts[0]
-                genes = [g for g in parts[2:] if g]  # 空文字除去
-                if genes:
-                    pathways[pathway_name] = genes
-    return pathways
+                # parts[1] はURL/description、parts[2:] がEntrez Gene IDs
+                entrez_ids = [g for g in parts[2:] if g]
+                
+                # Entrez ID → Gene Symbol に変換
+                symbols = []
+                for eid in entrez_ids:
+                    if eid in id_to_symbol:
+                        symbols.append(id_to_symbol[eid])
+                    else:
+                        unmapped_count += 1
+                
+                if symbols:
+                    pathways[pathway_name] = symbols
+    
+    return pathways, unmapped_count
 
-pathways = parse_gmt(enrichr_gmt)
+pathways, n_unmapped = parse_gmt_with_mapping(official_gmt, entrez_to_symbol)
 all_genes = set(g for genes in pathways.values() for g in genes)
 
-print(f"=== WikiPathways GMTファイル概要 ({ENRICHR_LIBRARY}) ===")
+print(f"=== WikiPathways 公式GMTファイル概要 ===")
 print(f"パスウェイ数: {len(pathways)}")
-print(f"遺伝子数（ユニーク）: {len(all_genes):,}")
+print(f"遺伝子数（ユニーク、シンボル変換済み）: {len(all_genes):,}")
+if n_unmapped > 0:
+    print(f"⚠ マッピング不可のEntrez ID: {n_unmapped}件（スキップ済み）")
 print()
 print("--- パスウェイ例（先頭5件）---")
 for i, (name, genes) in enumerate(pathways.items()):
@@ -728,9 +758,10 @@ print(f"✓ 結果をCSVに保存しました: {output_csv}")
 # サマリー統計
 print(f"\\n=== 解析サマリー ===")
 print(f"入力遺伝子数: {len(gene_list)}")
-print(f"使用GMTファイル: {ENRICHR_LIBRARY}")
-print(f"公式GMTファイル（ローカル保存）: {os.path.basename(official_gmt)}")
+print(f"使用GMTファイル: {os.path.basename(official_gmt)}")
 print(f"パスウェイデータベース: WikiPathways ({SPECIES})")
+print(f"背景遺伝子数: {BACKGROUND_GENE_COUNT:,}")
+print(f"検定方法: Fisher's exact test + BH FDR補正")
 print(f"テスト済みパスウェイ数: {len(pathways)}")
 print(f"有意なパスウェイ数 (FDR < 0.05): {len(results_df)}")
 if not results_df.empty:
