@@ -34,20 +34,19 @@ md("""---
 ## 1. セットアップ & ライブラリのインポート""")
 
 code("""# 必要なライブラリのインストール（未インストールの場合）
-!pip install -q gseapy plotly matplotlib pandas requests""")
+!pip install -q scipy plotly pandas requests""")
 
 code("""import os
 import requests
 import re
 import pandas as pd
 import numpy as np
-import gseapy as gp
+from scipy import stats
 import plotly.graph_objects as go
 from collections import OrderedDict, defaultdict
 import warnings
 warnings.filterwarnings('ignore')
 
-print(f"GSEApy version: {gp.__version__}")
 print("セットアップ完了 ✓")""")
 
 # ===== Section 2 =====
@@ -196,21 +195,106 @@ print(f"遺伝子リスト: {', '.join(gene_list[:10])}...")""")
 
 md("""### ORA（Over-Representation Analysis）の実行
 
-Fisher's exact testを用いてパスウェイの濃縮度を評価します。""")
+Fisher's exact testを用いてパスウェイの濃縮度を評価し、Benjamini-Hochberg法でFDR補正を行います。""")
 
-code("""# GSEApyを使ったOver-Representation Analysis
-enr = gp.enrich(
-    gene_list=gene_list,          # 解析対象の遺伝子リスト
-    gene_sets=enrichr_gmt,        # WikiPathways GMTファイル（遺伝子シンボル版）
-    outdir=None,                  # 結果をファイルに保存しない
-    no_plot=True,
-    cutoff=0.05,                  # FDR閾値
-)
+code("""# =====================================================
+# ★ 背景遺伝子数の設定（デフォルト: 20,000） ★
+# =====================================================
+BACKGROUND_GENE_COUNT = 20000
 
-# 結果をDataFrameとして取得
-results_df = enr.results.copy()
+def run_fisher_ora(gene_list, pathways, background=BACKGROUND_GENE_COUNT):
+    \"\"\"
+    Fisher's exact test によるOver-Representation Analysis
+    
+    Parameters:
+        gene_list: 解析対象の遺伝子リスト
+        pathways: dict {pathway_name: [gene1, gene2, ...]}
+        background: 背景遺伝子数（デフォルト20,000）
+    
+    Returns:
+        DataFrame with enrichment results
+    \"\"\"
+    gene_set = set(gene_list)
+    n_input = len(gene_set)
+    results = []
+    
+    for pw_name, pw_genes in pathways.items():
+        pw_gene_set = set(pw_genes)
+        pw_size = len(pw_gene_set)
+        
+        # ヒット遺伝子（入力リストとパスウェイの共通遺伝子）
+        overlap_genes = gene_set & pw_gene_set
+        n_overlap = len(overlap_genes)
+        
+        if n_overlap == 0:
+            continue
+        
+        # 2×2分割表（Fisher's exact test）
+        #                 パスウェイ内  パスウェイ外
+        # 入力リスト内      a           b
+        # 入力リスト外      c           d
+        a = n_overlap
+        b = n_input - n_overlap
+        c = pw_size - n_overlap
+        d = background - n_input - c
+        d = max(d, 0)  # 負にならないように
+        
+        # Fisher's exact test（片側、greater）
+        _, pvalue = stats.fisher_exact([[a, b], [c, d]], alternative='greater')
+        
+        # オッズ比
+        odds_ratio = (a * d) / (b * c) if (b * c) > 0 else float('inf')
+        
+        results.append({
+            'Term': pw_name,
+            'Overlap': f'{n_overlap}/{pw_size}',
+            'P-value': pvalue,
+            'Odds Ratio': odds_ratio,
+            'Genes': ';'.join(sorted(overlap_genes)),
+            'Hit_Count': n_overlap,
+            'Pathway_Size': pw_size,
+        })
+    
+    if not results:
+        return pd.DataFrame()
+    
+    df = pd.DataFrame(results)
+    df = df.sort_values('P-value')
+    
+    # Benjamini-Hochberg FDR補正
+    n_tests = len(df)
+    df['rank'] = range(1, n_tests + 1)
+    df['Adjusted P-value'] = df['P-value'] * n_tests / df['rank']
+    
+    # FDRが単調減少になるように補正（後ろから前に向かって最小値を取る）
+    df['Adjusted P-value'] = df['Adjusted P-value'].iloc[::-1].cummin().iloc[::-1]
+    df['Adjusted P-value'] = df['Adjusted P-value'].clip(upper=1.0)
+    
+    df = df.drop(columns=['rank'])
+    
+    # Combined Score = -log10(p) * odds_ratio
+    df['Combined Score'] = -np.log10(df['P-value'].clip(lower=1e-300)) * df['Odds Ratio']
+    
+    return df.reset_index(drop=True)
 
-# カラム名を日本語化して表示用に整形
+print(f"背景遺伝子数: {BACKGROUND_GENE_COUNT:,}")
+print("✓ Fisher's exact test ORA 関数を定義しました")""")
+
+code("""# === エンリッチメント解析の実行 ===
+results_df = run_fisher_ora(gene_list, pathways, background=BACKGROUND_GENE_COUNT)
+
+# FDR < 0.05 でフィルタ
+results_df = results_df[results_df['Adjusted P-value'] < 0.05].copy()
+results_df = results_df.sort_values('Adjusted P-value').reset_index(drop=True)
+
+print(f"=== エンリッチメント解析結果 ===")
+print(f"検定方法: Fisher's exact test (片側)")
+print(f"多重検定補正: Benjamini-Hochberg FDR")
+print(f"背景遺伝子数: {BACKGROUND_GENE_COUNT:,}")
+print(f"有意なパスウェイ数 (FDR < 0.05): {len(results_df)}")
+print()
+
+# 表示用に整形
 display_df = results_df[[
     'Term', 'Overlap', 'P-value', 'Adjusted P-value',
     'Odds Ratio', 'Combined Score', 'Genes'
@@ -219,13 +303,6 @@ display_df.columns = [
     'パスウェイ', 'ヒット数/パスウェイサイズ', 'P値', 'FDR補正P値',
     'オッズ比', 'Combined Score', '遺伝子'
 ]
-
-# FDR補正P値でソート
-display_df = display_df.sort_values('FDR補正P値')
-
-print(f"=== エンリッチメント解析結果 ===")
-print(f"有意なパスウェイ数 (FDR < 0.05): {len(display_df)}")
-print()
 
 # 上位20件を表示
 display_df.head(20).style.format({
